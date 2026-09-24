@@ -5,9 +5,10 @@
 
 赛方提供**不限次、不消耗配额**的在线格式检查，但每次都要上传几百 MB 再等回包。
 这个工具把同样的检查放在本地做，几秒钟给出结果，还会指出具体是哪个基因、哪一位错了。
+它还查一件在线检查不查的事：`.X` 是不是 log1p(CP10k) 的尺度（见下面第 7 条）。
 
 ```bash
-git clone https://github.com/<你的用户名>/vec-submit-check && cd vec-submit-check
+git clone https://github.com/gh-dv-openclaw/vec-submit-check && cd vec-submit-check
 bash fetch_panels.sh                 # 拉基因 panel，公开的，不需要登录
 pip install anndata scipy numpy      # 或 uv pip install
 python validate_submission.py --board T1:val --input pred.h5ad
@@ -25,10 +26,14 @@ T1:val  (T1 · validation (E10.5))
   [PASS] .X non-negative        最小 0
   [PASS] .X dtype               float32
   [PASS] .X layout              sparse（稀疏/稠密都收，评分前会转稠密）
+  [PASS] .X scale               log1p(CP10k)：每个细胞 expm1 行和 = 10,000，与发布文件同一尺度
   [PASS] obs                    未携带 celltype（正确）
 
   格式检查全过（这不预示分数，只说明文件收得下）
 ```
+
+退出码：`0` 全过；`1` 有 FAIL，上传会被拒；`3` 收得下，但 `.X` 不像 log1p(CP10k)，
+分数没有意义。所以 `python validate_submission.py … && 上传` 这样的脚本两种情况都会停下。
 
 板名有五个：`T1:val`、`T2:heart:val_interp`、`T2:heart:val_extrap`、
 `T2:embryo:val_interp`、`T3:gata4`。
@@ -95,7 +100,47 @@ embryo 那块板因此只有 **498** 个基因而不是 500：`Casp4` 和 `Pnlip
 所以 `.X` 里出现 NaN/Inf 不是小事。负值通常意味着矩阵在上游某处被中心化过了——
 提交要求是 log 归一化后的非负值。
 
-### 7. 单文件不超过 1200 MB
+### 7. `.X` 的尺度：原始计数也收、也打分，而且什么提示都没有
+
+这是代价最高的一类错误。发布的每个文件（T1 和 MERFISH 都一样），`.X` 都是 **log1p(CP10k)**：
+每个细胞的计数先缩放到总和 10000，再取 log1p，所以每个细胞 `expm1(.X)` 加起来恰好是 10000。
+打分器不做任何归一化，你交什么它就按 log1p(CP10k) 去比。交上去的若是原始计数、没取 log 的值、
+或归一化到了别的总量，格式检查照样全过，服务器照样出分，只是分数没有意义，还用掉一次评分。
+
+本工具抽最多 2000 个细胞，按下面这些特征认出常见错法（退出码 3）：
+
+| 做法 | 认出来的依据 |
+|---|---|
+| 原始计数 | 非零值几乎全是整数 |
+| 二值化（有/无） | 非零值全是 1 |
+| 归一化了，没取 log | 值本身每个细胞加起来都一样 |
+| log1p(原始计数)，没按文库大小归一化 | `expm1(.X)` 几乎全是整数 |
+| 归一化到别的总量：CPM，或 scanpy 的默认值 | `expm1(.X)` 每个细胞加起来都一样，但不是 10000 |
+| 用了 log2 / log10 | 按对应的底还原后，每个细胞加起来恰好 10000 |
+| log1p 做了两次 | 连做两次 `expm1`，每个细胞加起来恰好 10000 |
+
+scanpy 那条最容易踩：`sc.pp.normalize_total(adata)` 不传 `target_sum` 时，用的是**中位文库大小**。
+全转录组的 scRNA 上它离 10000 不远；500 基因的 MERFISH 上每个细胞只有一两百个计数，
+归一化出来差了两个数量级。写成 `sc.pp.normalize_total(adata, target_sum=1e4)` 再 `sc.pp.log1p`。
+
+**最大值只写在说明里，不作判据。** 未经改动的 log1p(CP10k) 不会超过 log1p(10000) = 9.21，
+可模型在 log 空间放大数值之后超过它很正常：我们拿 370 份模型生成的真实预测试过，MERFISH 的
+那些有四分之三最大值超过 9.21，其中一份到了 679。上表的依据在这 370 份上没有一次误报，
+在全部发布文件上也没有。改过数值的预测，每个细胞的行和不再恒定，本工具据此放行，只在说明里
+报出行和的范围和最大值。
+
+### 8. 单文件不超过 1200 MB
+
+---
+
+## 测试
+
+```bash
+python -m pytest -q                  # 或者不装 pytest：python test_validate_submission.py
+```
+
+全部用合成数据：按发布文件的做法造出正确的文件，再把上面每种错法各造一份，
+在 scRNA 和 MERFISH 两种文库大小下检查退出码和点名的原因。
 
 ---
 
