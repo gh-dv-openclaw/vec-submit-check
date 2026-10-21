@@ -228,6 +228,98 @@ def test_scale_stats_on_released_format_is_exact():
     assert s["frac_int"] == 0.0 and s["vmax"] <= vs.LOG1P_CP10K_MAX + 1e-3, s
 
 
+# ---------- float32 转换必须与评分器一致 ----------
+
+def test_float32_expression_overflow_fails_and_skips_scale():
+    for layout in (np.asarray, sparse.csr_matrix, sparse.csc_matrix):
+        X = log1p_cp10k(counts()).toarray()
+        X[0, 0] = 1e40                         # float64 有限，float32 为 Inf
+        expect(adata(layout(X)), 1, "[FAIL] .X finite", "转为 float32 后", "[SKIP] .X scale")
+
+
+def test_float32_expression_rounding_boundary_passes():
+    maximum = float(np.finfo(np.float32).max)
+    above = np.nextafter(maximum, np.inf)
+    assert above > maximum and np.isfinite(np.float32(above))
+    for layout in (np.asarray, sparse.csr_matrix, sparse.csc_matrix):
+        for value in (0.0, maximum, above):
+            r = vs.Report()
+            assert vs.check_X(r, adata(layout(np.array([[value, 0.0]])), genes=GENES[:2]))
+            assert r.failed == 0
+
+
+def test_float32_coordinate_overflow_fails():
+    for value in (1e40, -1e40):
+        a = adata(f32(log1p_cp10k(counts())), coords=True)
+        a.obsm["spatial_3D"] = a.obsm["spatial_3D"].astype(np.float64)
+        a.obsm["spatial_3D"][0, 0] = value
+        expect(a, 1, "[FAIL] obsm['spatial_3D']", "转为 float32 后", board="TEST:merfish")
+
+
+def test_float32_coordinate_rounding_boundary_passes():
+    maximum = float(np.finfo(np.float32).max)
+    above = np.nextafter(maximum, np.inf)
+    for value in (maximum, above, -maximum, -above):
+        a = adata(f32(log1p_cp10k(counts())), coords=True)
+        a.obsm["spatial_3D"] = a.obsm["spatial_3D"].astype(np.float64)
+        a.obsm["spatial_3D"][0, 0] = value
+        expect(a, 0, "[PASS] obsm['spatial_3D']", board="TEST:merfish")
+
+
+def test_float32_ignored_coordinate_columns_do_not_fail():
+    a = adata(f32(log1p_cp10k(counts())), coords=True)
+    extra = np.resize([1e40, -1e40, np.nan, np.inf, -np.inf], a.n_obs)
+    a.obsm["spatial_3D"] = np.column_stack([a.obsm["spatial_3D"], extra])
+    expect(a, 0, "[PASS] obsm['spatial_3D']", "被忽略", board="TEST:merfish")
+
+
+def test_original_nonfinite_values_still_fail():
+    for value in (np.nan, np.inf, -np.inf):
+        for layout in (np.asarray, sparse.csr_matrix, sparse.csc_matrix):
+            a = adata(layout(np.array([[value, 0.0]])), genes=GENES[:2])
+            r = vs.Report()
+            assert not vs.check_X(r, a)
+            assert r.failed > 0
+        a.obsm["spatial_3D"] = np.array([[value, 0.0, 0.0]])
+        r = vs.Report()
+        vs.check_obsm(r, a, BOARDS["TEST:merfish"])
+        assert r.failed == 1
+
+
+def test_float32_checks_do_not_mutate_input_or_densify_sparse():
+    from types import SimpleNamespace
+
+    class NoDenseCSR(sparse.csr_matrix):
+        def toarray(self, *args, **kwargs):
+            raise AssertionError("check_X must not densify sparse input")
+
+        todense = toarray
+
+    class NoDenseCSC(sparse.csc_matrix):
+        toarray = NoDenseCSR.toarray
+        todense = toarray
+
+    for layout in (np.asarray, NoDenseCSR, NoDenseCSC):
+        for value in (1.0, 1e40):
+            X = layout(np.array([[value, 0.0], [0.0, 2.0]]))
+            arrays = (X.data, X.indices, X.indptr) if sparse.issparse(X) else (X,)
+            before = [arr.copy() for arr in arrays]
+            for arr in arrays:
+                arr.flags.writeable = False
+            r = vs.Report()
+            assert vs.check_X(r, SimpleNamespace(X=X)) == (value == 1.0)
+            assert all(np.array_equal(old, arr) for old, arr in zip(before, arrays))
+            assert X.dtype == np.float64
+    for value in (1.0, 1e40, -1e40):
+        coords = np.array([[value, 0.0, 0.0, np.nan]])
+        before = coords.copy()
+        coords.flags.writeable = False
+        r = vs.Report()
+        vs.check_obsm(r, SimpleNamespace(obsm={"spatial_3D": coords}), BOARDS["TEST:merfish"])
+        assert r.failed == int(abs(value) > 1.0)
+        assert np.array_equal(before, coords, equal_nan=True)
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
